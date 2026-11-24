@@ -11,10 +11,35 @@ from mia.core.runner import StepView, install_request_arg_stash, require_v2_runn
 from mia.workers._common import iter_matched_modules, match_layer
 
 
+def _check_vector_dir(vector_path: str) -> None:
+    """Refuse a vector outside ``MIA_STEER_VECTOR_DIR``, if it is set."""
+    allowed = os.environ.get("MIA_STEER_VECTOR_DIR")
+    if not allowed:
+        return
+    real = os.path.realpath(vector_path)
+    roots = [os.path.realpath(d) for d in allowed.split(os.pathsep) if d]
+    if not any(os.path.commonpath([real, root]) == root for root in roots):
+        raise ValueError(f"steering vector {vector_path!r} is outside MIA_STEER_VECTOR_DIR")
+
+
+def _numpy_safe_globals() -> list:
+    """What weights_only needs to rebuild a numpy float array (e.g. phi3_format.pt)."""
+    try:
+        from numpy._core.multiarray import _reconstruct
+    except ImportError:  # numpy < 2
+        from numpy.core.multiarray import _reconstruct
+    import codecs
+    dtype_classes = {type(np.dtype(t)) for t in ("f2", "f4", "f8")}
+    return [_reconstruct, np.ndarray, np.dtype, codecs.encode, *dtype_classes]
+
+
 def _load_steering_vector(vector_path: str) -> Dict:
+    _check_vector_dir(vector_path) 
     if not os.path.exists(vector_path):
         raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
-    return torch.load(vector_path, weights_only=False)
+    
+    with torch.serialization.safe_globals(_numpy_safe_globals()):
+        return torch.load(vector_path, weights_only=True)
 
 
 def _resolve_steer_config(steer_arg, env_default_path: Optional[str]) -> Optional[Dict]:
@@ -119,7 +144,8 @@ def steer_col_for(phase: str, positions: str, is_prefill: bool, is_final_chunk: 
     return lo
 
 
-def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict) -> "torch.Tensor":
+def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict,
+                hidden: "Optional[torch.Tensor]" = None) -> "torch.Tensor":
     method = cfg.get("method", "adjust_rs")
     steering_vec = data["dir"].to(rows.device, dtype=rows.dtype)
     if method == "add_vector":
@@ -128,7 +154,8 @@ def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict) -> "torch.Tensor":
     if method == "adjust_rs":
         unit_vec = steering_vec
         avg_proj = data["avg_proj"].to(rows.device, dtype=rows.dtype)
-        current_projections = torch.matmul(rows, unit_vec)
+        stream = rows if hidden is None else hidden + rows
+        current_projections = torch.matmul(stream, unit_vec)
         coeff = (avg_proj - current_projections).unsqueeze(-1)
         return rows + coeff * unit_vec.view(1, -1)
     raise ValueError(f"Unknown steering method: {method}")
@@ -235,7 +262,9 @@ class SteerWorker:
             PROF.incr("steer.fire")
 
             with PROF.timed("steer.apply", tier=2):
-                residuals = self._steer_per_request(residuals, entries, step)
+                # The next layer receives hidden_states + residuals, adjust_rs needs both.
+                residuals = self._steer_per_request(residuals, entries, step,
+                                                    hidden=hidden_states)
 
             if is_tuple:
                 return (hidden_states, residuals)
@@ -264,7 +293,7 @@ class SteerWorker:
             self._vector_cache[vector_path] = data
         return data
 
-    def _steer_per_request(self, residuals, entries, step: StepView):
+    def _steer_per_request(self, residuals, entries, step: StepView, hidden=None):
         qsl = step.query_start_loc_np
         n_rows = int(residuals.shape[0])
         mapped = int(qsl[step.num_reqs]) if len(qsl) > step.num_reqs else None
@@ -291,7 +320,7 @@ class SteerWorker:
 
         out = residuals
         for cfg, spans in groups.values():
-            steered = _steer_rows(residuals, cfg, self._vector_cache_for(cfg))
+            steered = _steer_rows(residuals, cfg, self._vector_cache_for(cfg), hidden=hidden)
             mask = np.zeros(n_rows, dtype=bool)
             for lo, hi in spans:
                 mask[lo:hi] = True
