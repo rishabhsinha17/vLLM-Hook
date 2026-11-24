@@ -5,7 +5,7 @@
 
 ---
 
-## What it does
+## Scoring
 
 Lowers the false-positive rate of a detector by adding a second check that only runs on the steps the first one flags. The final verdict flags a step only when both stages fire. Stage 1 is a cheap, high-recall gate. Stage 2 can be another probe on the same capture, or any slower scorer such as a guard model.
 
@@ -39,7 +39,21 @@ out = llm.analyze(analyzer_spec={"cascade_path": "cascade.json"}, run_id=run_id)
 # out["verdicts"], out["reached_stage2"], out["stage1"]["probabilities"], out["stage2"]["probabilities"]
 ```
 
-Both thresholds must come from `cascade.json` or the spec. The analyzer ignores each `probe.json` threshold, because that one was set for the probe on its own. The infer config must capture every probe layer. `"score_all": true` scores stage 2 on every step, which recalibration needs. A `decode_mean` probe needs each request's own capture, so generate with `extra_args={"hooks_on": "both"}` and `merge_probes=False`, then pass `probes=[o.probes for o in outputs]`. The default merged capture keeps only the prompt passes.
+Both thresholds must come from `cascade.json` or the spec. The analyzer ignores each `probe.json` threshold, because that one was set for the probe on its own. The infer config must capture every probe layer. `"score_all": true` scores stage 2 on every step, which recalibration needs.
+
+Both demo modes use the existing disk capture API. Set `hidden_states.mode` to `last_token` in the infer config. For a prompt-only cascade, capture with `hooks_on="prefill"`; for `decode_mean` or `decode_window`, use `hooks_on="both"`:
+
+```python
+from vllm import SamplingParams
+
+sampling = SamplingParams(temperature=0, max_tokens=32, extra_args={"hooks_on": "both"})
+outputs = llm.generate(prompts, sampling, save_to_disk=True, run_id="cascade_run")
+result = llm.analyze(analyzer_spec={"cascade_path": "cascade.json"}, run_id="cascade_run")
+```
+
+The analyzer splits each layer's captured passes using the artifact's `req_passes` counts, preserving request order even when output lengths differ. This works with the default PyTorch artifacts and with `MIA_USE_SAFETENSORS=1`. Last-token capture retains the final prompt pass and the decode passes, including with chunked prefill. The analyzer rejects all-token disk captures with multiple passes because their metadata does not identify each request's prefill boundary.
+
+A prompt-only cascade also accepts the usual merged `outputs[0].probes`. For decode scoring in memory, pass a list of captures from separate, single-request `generate` calls. A batched in-memory capture keeps only the prompt passes and cannot supply decode states. Decode positions refer to generated-token inputs: the final generated token has no captured decode state. The analyzer clips a window to the available states. An empty window raises an error. Supply `decode_windows` in the analyzer spec for `decode_window`, with one `[start, end]` or `None` per request. `None` uses the first `decode_tokens` states.
 
 ---
 
@@ -51,6 +65,7 @@ Both thresholds must come from `cascade.json` or the spec. The analyzer ignores 
 
 ```
 python examples/demo_two_stage.py
+python examples/demo_two_stage.py --decision
 ```
 
 The demo scores three AgentDojo steps, one clean, one whose action ignores an injection and one whose action follows it. It prints both stage scores and the verdict for each, and on an A40 the verdicts are pass, pass and flag. Stage 1 alone already passes the first two, and the demo shows the interface rather than a false alarm that stage 2 removes. With `--decision` the verdicts are pass, flag and flag, and that cascade flags the step whose action ignores the injection.
@@ -87,11 +102,15 @@ vLLM-Hook's own Attention Tracker analyzer can serve as a training-free stage 2.
 
 ## A decision-time stage 2 (experimental)
 
-A stage-2 probe can read the decode states of the first 16 generated tokens (`"position": "decode_mean"`), which still come before the tool executes, and `"decode_window"` with `tool_call_window` reads the tool call instead (no call-window probe is released). The decision-time cascade multiplies the presence probe by a probe on the first 16 tokens, with the stage-1 gate fixed at 97% recall, the configuration `--decision` runs. On 1,774 Qwen steps it lowers attacked-but-safe false alarms from 0.402 to 0.289 and clean ones from 0.389 to 0.232, at recall 0.893 against 0.899. On Granite, with held-out user tasks, it raised attacked-but-safe false alarms (0.346 to 0.439), and with a held-out tool suite Qwen's rose (0.485 to 0.685). On held-out injection tasks it lost recall on Qwen, and on Hermes among steps with a tool call, and a test with criteria fixed in advance adopted it on no model. It needs offline `MiaLLM` with `hooks_on="both"` and `merge_probes=False`, since the served path does not return per-request decode passes.
+A stage-2 probe can read the decode states of the first 16 generated tokens (`"position": "decode_mean"`), which still come before the tool executes, and `"decode_window"` with `tool_call_window` reads the tool call instead (no call-window probe is released). The decision-time cascade multiplies the presence probe by a probe on the first 16 tokens, with the stage-1 gate fixed at 97% recall, the configuration `--decision` runs. On 1,774 Qwen steps it lowers attacked-but-safe false alarms from 0.402 to 0.289 and clean ones from 0.389 to 0.232, at recall 0.893 against 0.899. On Granite, with held-out user tasks, it raised attacked-but-safe false alarms (0.346 to 0.439), and with a held-out tool suite Qwen's rose (0.485 to 0.685). On held-out injection tasks it lost recall on Qwen, and on Hermes among steps with a tool call, and a test with criteria fixed in advance adopted it on no model. The demo uses offline `MiaLLM` with `hooks_on="both"`, `save_to_disk=True` and analysis by `run_id` as above.
 
 ## Overhead
 
-In a run that warmed every batch first (Qwen, one A40, 17 generated tokens), capture at prefill for both probes added 0.12 s to a 0.82 s batch of 32, and an earlier 64-step benchmark found it within run-to-run noise. Capture at each decode pass with each request's rows read, which only the decision-time cascade needs, added 0.79 s per batch over capture off. The `tool_call_risk` and `two_stage_probe` analyzers each score 64 steps on CPU in under 2 ms.
+In a run that warmed every batch first (Qwen, one A40, 17 generated tokens), capture at prefill for both probes added 0.12 s to a 0.82 s batch of 32, and an earlier 64-step benchmark found it within run-to-run noise. Capture at each decode pass with each request's rows read, which only the decision-time cascade needs, added 0.79 s per batch over capture off. Those measurements used in-memory delivery. They do not include the disk writes and reads used by the current demo. The `tool_call_risk` and `two_stage_probe` analyzers each score 64 steps on CPU in under 2 ms.
+
+## Tests
+
+Run the CPU checks with `pytest tests/use_cases/test_two_stage.py`. On a CUDA machine with the package installed, `pytest tests/use_cases/test_two_stage_gpu.py -m gpu` also tests disk capture through a real OPT-125m engine. It covers both artifact formats in eager and CUDA-graph modes, chunked prefill, unequal request lengths, product stages and decode windows. The commands above run both Qwen demos with the released probes.
 
 ---
 

@@ -8,9 +8,9 @@ score is the product of its probes' probabilities (all of them must agree).
 Each probe reads one layer at one position:
   prompt_last   hidden state of the last prompt token (default; works on merged probes)
   decode_mean   mean of the states for generated tokens 1..decode_tokens. This needs each
-                request's own capture with ``hooks_on="both"``:
-                ``out = llm.generate(prompts, sp, merge_probes=False)`` and
-                ``probes=[o.probes for o in out]``.
+                request's prompt and decode passes: use ``hooks_on="both"``,
+                ``hidden_states.mode="last_token"`` and ``save_to_disk=True``, then
+                analyze by ``run_id``. The artifact's ``req_passes`` separates requests.
   decode_window mean of the states for the generated tokens in a per-request window, given as
                 ``"decode_windows": [[start, end] or None, ...]`` in the spec, one entry per
                 request (0-based generated-token indices, end exclusive; the spec must hold it).
@@ -55,20 +55,64 @@ def last_token_features(hs_cache: Dict, layer: int) -> np.ndarray:
     return torch.stack(rows).float().cpu().numpy()
 
 
+def _request_entries(entry: Dict) -> List[Dict]:
+    """Split a disk capture by the existing per-request pass counts.
+
+    Last-token capture keeps only the final prefill pass, even with chunked prefill.
+    All-token disk captures do not retain the prefill/decode boundary for each request.
+    """
+    passes = unpack_hidden_states(entry)
+    counts = entry["req_passes"]
+    if (any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in counts)
+            or sum(counts) != len(passes)):
+        raise ValueError("req_passes must contain nonnegative integers summing to the number of passes")
+    if not counts:
+        raise ValueError("capture contains no requests")
+    if entry.get("hs_mode", "last_token") != "last_token" and any(n > 1 for n in counts):
+        raise ValueError("Grouped captures with multiple passes need hidden_states.mode='last_token'; "
+                         "all_tokens disk artifacts do not retain each request's prefill boundary")
+    requests, start = [], 0
+    for i, n in enumerate(counts):
+        if not n:
+            raise ValueError(f"No hidden states for request {i}; capture every request before scoring")
+        one = {**entry, "hidden_states": passes[start:start + n]}
+        one.pop("req_passes")
+        if entry.get("pass_lens") is not None:
+            one["pass_lens"] = entry["pass_lens"][start:start + n]
+        requests.append(one)
+        start += n
+    return requests
+
+
 def request_features(probes: Dict, layer: int, position: str = "prompt_last",
                      decode_tokens: int = 16, window: Optional[Sequence[int]] = None) -> np.ndarray:
-    """(hidden,) feature of one request from its own capture (``merge_probes=False``).
+    """(hidden,) feature of one request from its own capture.
 
     Decode pass ``t`` (0-based) is the state whose input is generated token ``t``, so the last
     generated token has no state. ``window`` is used by ``decode_window`` only.
     """
     entry = _layer_entry(probes["hs_cache"], layer)
-    passes = [t if t.dim() == 1 else t[-1] for t in unpack_hidden_states(entry)]
-    n_prefill = max(int(entry.get("_n_prefill", 1)), 1)
+    tensors = unpack_hidden_states(entry)
+    lens = entry.get("pass_lens")
+    if lens is not None and len(lens) != len(tensors):
+        raise ValueError("pass_lens must have one length per captured pass")
+    passes = []
+    for i, t in enumerate(tensors):
+        if t is None or not t.numel():
+            raise ValueError("request contains an empty hidden-state pass")
+        n = int(lens[i]) if lens is not None else (len(t) if t.dim() > 1 else 1)
+        if not 0 < n <= (len(t) if t.dim() > 1 else 1):
+            raise ValueError("pass_lens must identify real rows within each captured pass")
+        passes.append(t if t.dim() == 1 else t[n - 1])
+    n_prefill = int(entry.get("prefill_passes", entry.get("_n_prefill", 1)))
+    if not 0 < n_prefill <= len(passes):
+        raise ValueError("request needs a captured prompt pass; use hooks_on='both' for decode probes")
     if position == "prompt_last":
         return passes[n_prefill - 1].float().cpu().numpy()
     if position not in ("decode_mean", "decode_window"):
         raise ValueError(f"position must be one of {POSITIONS}, got {position!r}")
+    if decode_tokens <= 0:
+        raise ValueError("decode_tokens must be positive")
     start, end = 0, decode_tokens
     if position == "decode_window" and window is not None:
         start, end = int(window[0]), int(window[1])
@@ -140,12 +184,15 @@ class TwoStageProbeAnalyzer:
         position = member.get("position", probe.artifact.meta.get("position", "prompt_last"))
         k = int(member.get("decode_tokens", probe.artifact.meta.get("decode_tokens", 16)))
         if isinstance(probes, dict):
-            if position != "prompt_last":
-                raise ValueError(
-                    f"{member['probe_path']} reads position {position!r}, which a merged capture "
-                    "does not hold. Generate with merge_probes=False and pass "
-                    "probes=[o.probes for o in outputs].")
-            return last_token_features(probes["hs_cache"], probe.layer)
+            entry = _layer_entry(probes["hs_cache"], probe.layer)
+            if "req_passes" not in entry:
+                if position != "prompt_last":
+                    raise ValueError(
+                        f"{member['probe_path']} reads position {position!r}, which needs request "
+                        "boundaries. Generate with save_to_disk=True and hooks_on='both', then "
+                        "analyze by run_id; alternatively pass a list of single-request captures.")
+                return last_token_features(probes["hs_cache"], probe.layer)
+            probes = [{"hs_cache": {"layer": e}} for e in _request_entries(entry)]
         if position == "decode_window" and windows is None:
             raise ValueError(
                 f"{member['probe_path']} reads position 'decode_window', so the spec needs "
@@ -164,8 +211,9 @@ class TwoStageProbeAnalyzer:
     ) -> Dict:
         """Score each step with both stages.
 
-        ``probes`` is a merged capture (``out[0].probes``) or a list of per-request captures
-        (``[o.probes for o in out]`` after ``generate(..., merge_probes=False)``). Both
+        ``run_id`` loads a disk capture, including decode passes grouped by ``req_passes``.
+        ``probes`` can also be a prompt-only merged capture (``out[0].probes``), a loaded
+        disk capture, or a list of captures from separate single-request calls. Both
         thresholds must come from ``cascade.json`` or the spec; probe.json thresholds are
         ignored because each was calibrated for its probe alone. ``"score_all": true``
         scores stage 2 on every step, which recalibration needs.
@@ -196,6 +244,8 @@ class TwoStageProbeAnalyzer:
                 pr = self._probe(m["probe_path"])
                 feats[s].append((pr, self._features(m, pr, probes, spec.get("decode_windows"))))
         n = len(feats["stage1"][0][1])
+        if any(len(x) != n for stage in feats.values() for _, x in stage):
+            raise ValueError("Every probe layer must contain the same number of requests")
 
         def scorer(stage):
             def run(idx):

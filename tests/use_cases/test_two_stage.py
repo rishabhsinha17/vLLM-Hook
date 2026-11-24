@@ -402,7 +402,7 @@ def test_decode_position_on_merged_capture_names_the_fix(tmp_path):
     p1, _ = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
     pd, _ = _write_positioned(tmp_path / "dec", 21, 2, "decode_mean")
     merged = {"hs_cache": {"model.layers.20": {"hidden_states": [torch.zeros(HIDDEN)] * 3, "layer_num": 21}}}
-    with pytest.raises(ValueError, match="merge_probes=False"):
+    with pytest.raises(ValueError, match="save_to_disk=True"):
         TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
             analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5},
                            "stage2": {"probe_path": pd, "threshold": 0.5}}, probes=merged)
@@ -528,3 +528,87 @@ def test_analyzer_takes_per_request_decode_windows(tmp_path):
     with pytest.raises(ValueError, match="decode_windows has 3 entries for 12 requests"):
         TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec={**spec, "decode_windows": windows[:3]},
                                                          probes=reqs)
+
+
+@pytest.mark.parametrize("safetensors", [False, True])
+@pytest.mark.parametrize("position", ["prompt_last", "decode_mean", "decode_window"])
+def test_disk_capture_round_trip_preserves_requests(tmp_path, monkeypatch, safetensors, position):
+    """Use MIA's real writer/loader, with different decode lengths and a product stage."""
+    from mia.core.delivery.delivered_probes import hs_probes, merge_disk
+    from mia.core.delivery.artifact_writer import save_hs_cache_safetensors
+
+    monkeypatch.setenv("MIA_USE_SAFETENSORS", str(int(safetensors)))
+    p1, a = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
+    pp, b = _write_positioned(tmp_path / "pres", 21, 1, "prompt_last")
+    pd, c = _write_positioned(tmp_path / "dec", 21, 2, position, decode_tokens=3)
+    rng = np.random.default_rng(70)
+    pl = rng.normal(size=(3, HIDDEN)).astype(np.float32)
+    dec = [rng.normal(size=(n, HIDDEN)).astype(np.float32) for n in (2, 5, 3)]
+    windows = [None, [1, 4], [0, 2]]
+    cache = None
+    for i, d in enumerate(dec):
+        rows = torch.from_numpy(np.vstack([pl[i], d]))
+        one = hs_probes({21: rows}, {"hs_mode": "last_token", "hooks_on": "both",
+                                    "n_prompt": 10, "n_gen": len(d) + 1, "config": {}},
+                        {21: "model.layers.20"}, layout="disk")
+        cache = merge_disk(cache, one, i)
+    run = tmp_path / "capture"
+    run.mkdir()
+    if safetensors:
+        save_hs_cache_safetensors(cache, str(run), "last_token", 0)
+    else:
+        torch.save(cache, run / "hidden_states.pt")
+    spec = {"stage1": {"probe_path": p1, "threshold": 0.4},
+            "stage2": {"product": [{"probe_path": pp}, {"probe_path": pd}], "threshold": 0.3},
+            "decode_windows": windows, "score_all": True}
+    out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(spec, run_id="capture")
+    if position == "prompt_last":
+        x = pl
+    else:
+        x = np.stack([d[w[0]:w[1]].mean(0) if position == "decode_window" and w
+                      else d[:3].mean(0) for d, w in zip(dec, windows)])
+    q1, q2 = _prob(pl, a), _prob(pl, b) * _prob(x, c)
+    np.testing.assert_allclose(out["stage1"]["probabilities"], q1, rtol=1e-5)
+    np.testing.assert_allclose(out["stage2"]["probabilities"], q2, rtol=1e-4)
+    assert out["verdicts"] == ["flag" if u >= .4 and v >= .3 else "pass" for u, v in zip(q1, q2)]
+
+
+@pytest.mark.parametrize("counts,match", [([1, 0, 2], "request 1"), ([1, 1], "summing"),
+                                        ([1, -1, 3], "nonnegative"), ([1.5, 1.5], "integers")])
+def test_disk_capture_rejects_missing_or_invalid_request_boundaries(tmp_path, counts, match):
+    p, _ = _write_probe(tmp_path / "probe", 21, .5, 0)
+    entry = {"layer_num": 21, "hidden_states": [torch.zeros(HIDDEN)] * 3, "req_passes": counts}
+    spec = {s: {"probe_path": p, "threshold": .5} for s in ("stage1", "stage2")}
+    with pytest.raises(ValueError, match=match):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(spec, probes={"hs_cache": {"layer": entry}})
+
+
+def test_prompt_only_disk_capture_cannot_supply_decode_states(tmp_path):
+    p1, _ = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
+    pd, _ = _write_positioned(tmp_path / "dec", 21, 2, "decode_mean")
+    entry = {"layer_num": 21, "hidden_states": [torch.zeros(HIDDEN)] * 3, "req_passes": [1, 1, 1]}
+    with pytest.raises(ValueError, match="hooks_on"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+            {"stage1": {"probe_path": p1, "threshold": .5},
+             "stage2": {"probe_path": pd, "threshold": .5}}, probes={"hs_cache": {"layer": entry}})
+
+
+def test_per_request_features_use_real_rows_and_prefill_count():
+    from torch.nn.utils.rnn import pad_sequence
+
+    passes = [torch.ones(4, HIDDEN), torch.full((2, HIDDEN), 2.), torch.full((1, HIDDEN), 3.),
+              torch.full((1, HIDDEN), 4.)]
+    entry = {"layer_num": 21, "hidden_states": pad_sequence(passes, batch_first=True),
+             "pass_lens": [4, 2, 1, 1], "prefill_passes": 2, "hs_mode": "all_tokens"}
+    request = {"hs_cache": {"layer": entry}}
+    np.testing.assert_array_equal(request_features(request, 21), np.full(HIDDEN, 2.))
+    np.testing.assert_array_equal(request_features(request, 21, "decode_mean"), np.full(HIDDEN, 3.5))
+
+
+def test_grouped_all_token_capture_requires_unambiguous_prefill(tmp_path):
+    p, _ = _write_probe(tmp_path / "probe", 21, .5, 0)
+    entry = {"layer_num": 21, "hs_mode": "all_tokens", "req_passes": [2],
+             "hidden_states": [torch.ones(4, HIDDEN), torch.ones(2, HIDDEN)]}
+    spec = {s: {"probe_path": p, "threshold": .5} for s in ("stage1", "stage2")}
+    with pytest.raises(ValueError, match="prefill boundary"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(spec, probes={"hs_cache": {"layer": entry}})

@@ -87,19 +87,18 @@ def main():
             return_dict=False)}
         for s in steps
     ]
-    if args.decision:
-        # Each request keeps its own capture so stage 2 can read its decode passes.
-        sp = SamplingParams(temperature=0.0, max_tokens=256, extra_args={"hooks_on": "both"})
-        outputs = llm.generate(prompts, sp, merge_probes=False)
-        spec = {"cascade_path": os.path.join(ART_DIR, "two_stage_decision", "cascade.json"), "score_all": True}
-        result = llm.analyze(analyzer_spec=spec, probes=[o.probes for o in outputs])
-    else:
-        run_id = "two_stage_demo"
-        outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=256),
-                               save_to_disk=True, run_id=run_id)
-        spec = {"cascade_path": os.path.join(ART_DIR, "two_stage", "cascade.json"), "score_all": True}
+    # Disk artifacts retain every request's passes; the analyzer uses req_passes to split them.
+    cascade = "two_stage_decision" if args.decision else "two_stage"
+    run_id = cascade + "_demo"
+    sp = SamplingParams(temperature=0.0, max_tokens=256,
+                        extra_args={"hooks_on": "both" if args.decision else "prefill"})
+    try:
+        outputs = llm.generate(prompts, sp, save_to_disk=True, run_id=run_id)
+        spec = {"cascade_path": os.path.join(ART_DIR, cascade, "cascade.json"), "score_all": True}
         result = llm.analyze(analyzer_spec=spec, run_id=run_id)
-    report(steps, [o.outputs[0].text for o in outputs], result)
+        report(steps, [o.outputs[0].text for o in outputs], result)
+    finally:
+        llm.llm_engine.engine_core.shutdown()
 
 
 if __name__ == "__main__":
